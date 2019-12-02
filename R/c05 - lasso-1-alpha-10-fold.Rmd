@@ -1,0 +1,192 @@
+---
+title: "lasso cox regression"
+author: "Congcong Gong"
+date: "2018/5/23"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(tidy = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+options(stringsAsFactors=FALSE)
+```
+
+
+```{r library packages,warning=F,message=F}
+library('ggplot2')
+library('tidyverse')
+library('glmnet')
+library('readxl')
+library('knitr')
+library('pheatmap')
+library('ape')
+library('survival')
+library('survminer')
+library('VIM')
+library('rms')
+set.seed(20180523)
+```
+
+
+```{r clean data,warning=F}
+
+lname1 <- load('data/STAD_TCGA.RData')
+lname2 <- load('data/DEGs_sur.RData')
+dat <- STAD_RNASeq$merged.dat
+
+gene <- diff_gene$SYMBOL[diff_gene$pval<=0.05]
+dat <- STAD_RNASeq$merged.dat %>% as.data.frame()
+dat <- dat[dat$bcr %in% rownames(clinical),c('bcr','status','OS',colnames(dat)[(colnames(dat) %in% gene)])]
+```
+
+```{r}
+dat_for_cor <- dat[,-c(1,2,3)]
+phm <- cor(dat_for_cor) %>% pheatmap(color = colorRampPalette(c('green','white','red'))(100),breaks = seq(-1,1,length.out = 100),filename = './plots/corheatmap.pdf',show_rownames=F,show_colnames=F)
+cluster <- cutree(phm$tree_row,3)
+table(cluster) 
+gene_2 <- cluster[cluster=='2'] %>% names()
+gene <- gene_2[gene_2 %in% gene]
+```
+
+```{r}
+dat <- dat[dat$bcr %in% rownames(clinical),c('bcr','status','OS',colnames(dat)[(colnames(dat) %in% gene)])]#
+t_dat <- clinical[dat$bcr,] %>% as.data.frame()
+t_dat$pathologyTstage <- str_sub(t_dat$pathologyTstage,1,2)
+t_dat <- t_dat[complete.cases(t_dat$pathologicstage),]
+kable(table(t_dat$pathologyTstage),align = 'c',caption = 'Tab.1 Sample size of different depth of invasion',col.names = c('Depth of Invasion','Number'))
+dat <- dat[dat$bcr %in% rownames(t_dat),]
+rownames(dat) <- dat$bcr
+dim(dat)
+```
+
+```{r}
+dat_1 <- dat
+mins <- apply(dat_1[,-c(1:3)],2,min)
+maxs <- apply(dat_1[,-c(1:3)],2,max)
+dat_1[,-c(1:3)] <- scale(dat_1[,-c(1:3)],center = mins, scale=maxs) 
+```
+
+```{r glmnet}
+set.seed(20180523)
+dat_1 <- dat_1[which(dat_1$OS != 0),]
+index <- sample(1:nrow(dat_1),round(0.75*nrow(dat_1)))
+train <- dat_1[index,]
+test <- dat_1[-index,]
+n <- colnames(train[,-c(1:3)])
+myFormula <- paste('~',(paste(n,collapse = '+')),sep = '') %>% as.formula()
+x <- model.matrix(myFormula, train)
+y <- Surv(train$OS, train$status)
+glmnet.cv <- cv.glmnet(x, y, family = "cox")
+glmnet.obj <- glmnet.cv$glmnet.fit
+optimal.lambda <- glmnet.cv$lambda.min
+plot(glmnet.cv)
+glmnet2 <- glmnet(x,y,family = 'cox')
+plot(glmnet2,xvar='lambda',label=T)
+lambda.index <- which(glmnet.obj$lambda==optimal.lambda)
+optimal.beta  <- glmnet.obj$beta[,lambda.index]
+nonzero.coef <- abs(optimal.beta)>0
+selectedBeta <- optimal.beta[nonzero.coef]
+selectedVar   <- train[,nonzero.coef]
+reformat_dataSet <- train[,c('OS','status',names(selectedBeta))]
+glmnet.cox.meaningful <- step(coxph(Surv(OS,status) ~.,data=reformat_dataSet))
+glmnet.cox.meaningful %>% summary
+model <- glmnet.cox.meaningful$coefficients
+model.formula <- paste(model,names(model),sep='*') %>% paste(collapse = '+') %>% paste('TCS',.,sep='=') 
+model.formula 
+optimal.lambda 
+write.table(model,file='./model_formula.txt',quote=FALSE,col.names=FALSE)
+```
+
+**模型**：
+        $$ 
+       TCS = `r model[1]` \times `r names(model[1])` + `r model[2]` \times `r names(model[2])` 
+        $$
+
+```{r}
+model <- function(a){
+        a <- unlist(a)
+        b <- c(a[names(a)=='FOLR2'],a[names(a)=='GAMT'])
+        b <- as.numeric(b)
+        2.98024628551106*b[1]+b[2]*2.72660441164357 %>% return()
+}
+test.pre <- test 
+test.pre$TCS <- test.pre %>% apply(X = .,1,model)
+train.pre <- train 
+train.pre$TCS <- train.pre %>% apply(X = .,1,model)
+all.pre <- dat
+all.pre$TCS <- all.pre %>% apply(X = .,1,model)
+all.pre$TCS_F <- ifelse(all.pre$TCS>= median(all.pre$TCS),'H','L')
+all.cohort <- all.pre
+train.cohort <- train.pre
+train.cohort$TCS_F <- ifelse(train.cohort$TCS>= median(train.pre$TCS),'H','L')
+test.cohort <- test.pre
+test.cohort$TCS_F <- ifelse(test.cohort$TCS>= median(test.pre$TCS),'H','L')
+```
+
+```{r}
+
+```
+
+
+```{r BY TCS}
+percent.by.TCS.2 <- function(trainortest,type){
+        n <- paste(trainortest,'cohort',sep='.')
+        datasets <- get(n)
+        temp <- data.frame(type=t_dat[rownames(datasets),type],TCS=datasets$TCS_F)
+        ttest <- aov(datasets$TCS~t_dat[rownames(datasets),type])
+        temptable <- table(temp) 
+        for(i in 1:nrow(temptable)){
+                for(j in 1:ncol(temptable)){
+                        temptable[i,j] <- paste(table(temp)[i,j],
+                                                '(',
+                                                round(table(temp)[i,j]*100/sum(table(temp)[i,]),
+                                                      2),
+                                                '%)',
+                                                sep='')
+                        }
+        }
+        temp$TCS_F <- ifelse(temp$TCS=='H',1,0)
+        print(paste(trainortest,type,': '))
+        print(kable(temptable))
+        print('annova test: ')
+        print(summary(ttest))
+        print(table(temp) %>% apply(1,sum) %>% kable())
+}
+kable(table(train.cohort$TCS_F),caption='train,TCS: ')
+kable(table(test.cohort$TCS_F),caption='test,TCS: ')
+t_dat$Tstage <- ifelse(t_dat$pathologyTstage=='t1','T1','Tn')
+percent.by.TCS.2('train','gender')
+percent.by.TCS.2('test','gender')
+percent.by.TCS.2('train','pathologyTstage') 
+percent.by.TCS.2('test','pathologyTstage')
+percent.by.TCS.2('train','pathologicstage')
+percent.by.TCS.2('test','pathologicstage')
+percent.by.TCS.2('train','Tstage')
+percent.by.TCS.2('all','Tstage')
+```
+
+```{r mean TCS}
+train.mean.tcs.dat <- data.frame(train.pre,row.names = train$bcr,t_dat[train$bcr,]) 
+
+train.sum.dat <- train.mean.tcs.dat %>% group_by(pathologyTstage) %>% summarise(n=n(),median=median(TCS),mean=mean(TCS),sd=sd(TCS),se=sd(TCS)/sqrt(n()),ci=sd(TCS)/sqrt(n())*qt(0.95/2+0.5,n()-1))
+
+
+p_folr2_expression_T <- train.mean.tcs.dat  %>% ggplot(aes(pathologyTstage,FOLR2))+geom_boxplot(aes(fill=pathologyTstage),alpha=0.3)+geom_point(aes(color=pathologyTstage),position = position_jitter(),alpha=0.3)+stat_compare_means(method = 'wilcox.test',ref.group = 'i',label = 'p')+ggsci::scale_fill_lancet()+ggsci::scale_color_lancet()+stat_summary(fun.y = mean,geom = 'point',color='yellow')
+
+ggsave('./plots/p_folr2_expression_T.pdf',p_folr2_expression_T)
+
+p_gamt_expression_T <- train.mean.tcs.dat  %>% ggplot(aes(pathologyTstage,GAMT))+geom_boxplot(aes(fill=pathologyTstage),alpha=0.3)+geom_point(aes(color=pathologyTstage),position = position_jitter(),alpha=0.3)+stat_compare_means(method = 'wilcox.test',ref.group = 'i',label = 'p')+ggsci::scale_fill_lancet()+ggsci::scale_color_lancet()+stat_summary(fun.y = mean,geom = 'point',color='yellow')
+
+ggsave('./plots/p_gamt_expression_T.pdf',p_gamt_expression_T)
+
+p_TCS_T <- train.mean.tcs.dat  %>% ggplot(aes(pathologyTstage,TCS))+geom_boxplot(aes(fill=pathologyTstage),alpha=0.5)+geom_point(aes(color=pathologyTstage),position = position_jitter())+stat_compare_means(method = 'wilcox.test',ref.group = 'i',label = 'p')+ggsci::scale_fill_lancet()+ggsci::scale_color_lancet()+stat_summary(fun.y = mean,geom = 'point',color='yellow')
+
+ggsave('./plots/p_TCS_T .pdf',p_TCS_T )
+
+```
+
+
